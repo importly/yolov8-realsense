@@ -157,4 +157,3 @@ try:
 finally:
 	pipeline.stop()
 	cv2.destroyAllWindows()
-
