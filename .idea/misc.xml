@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="yolov8_realsense" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="yolov8_rs" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="moetus" project-jdk-type="Python SDK" />
 </project>

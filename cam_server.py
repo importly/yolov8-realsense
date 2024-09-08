@@ -5,9 +5,7 @@
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-import torch
 import logging
-from ultralytics import YOLO
 from networktables import NetworkTables
 import time
 import sys
@@ -18,8 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Debug mode flag
-DEBUG_MODE = False
-
+DEBUG_MODE = True
 
 def initialize_network_tables():
 	try:
@@ -28,7 +25,6 @@ def initialize_network_tables():
 	except Exception as e:
 		logger.error(f"Failed to initialize NetworkTables: {str(e)}")
 		return None
-
 
 def initialize_camera():
 	try:
@@ -52,16 +48,36 @@ def initialize_camera():
 		logger.error(f"Failed to initialize camera: {str(e)}")
 		return None, None
 
+def detect_aruco_markers(color_image):
+	# Load the predefined dictionary of ArUco markers
+	aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
 
-def load_model():
+	# Convert the color image to grayscale for detection
+	gray_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+
+	# Detect ArUco markers in the grayscale image
+	corners, ids, rejected = cv2.aruco.detectMarkers(gray_image, aruco_dict)
+
+	return corners, ids
+
+def get_center_depth(center_x, center_y, depth_image):
 	try:
-		device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-		logger.info(f"Using device: {device}")
-		return YOLO('yolov8n-seg.pt').to(device), device
-	except Exception as e:
-		logger.error(f"Failed to load model: {str(e)}")
-		return None, None
+		# Get the depth at the center point
+		depth_value = depth_image[center_y, center_x]
 
+		if depth_value > 0:
+			return depth_value / 1000.0  # Convert depth from millimeters to meters
+		else:
+			return None
+	except IndexError as e:
+		logger.error(f"Invalid index for depth retrieval: {str(e)}")
+		return None
+
+def convert_depth_image(depth_image):
+	# Normalize the depth image for display
+	depth_display = cv2.convertScaleAbs(depth_image, alpha=0.03)  # Scale the depth for better visualization
+	depth_colormap = cv2.applyColorMap(depth_display, cv2.COLORMAP_JET)
+	return depth_colormap
 
 def main():
 	global DEBUG_MODE
@@ -77,10 +93,6 @@ def main():
 
 	pipeline, hole_filling = initialize_camera()
 	if pipeline is None or hole_filling is None:
-		return
-
-	model, device = load_model()
-	if model is None or device is None:
 		return
 
 	frame_counter = 0
@@ -101,33 +113,43 @@ def main():
 			filled_depth_image = np.asanyarray(filled_depth.get_data())
 			color_image = np.asanyarray(color_frame.get_data())
 
-			depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
-			filled_depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(filled_depth_image, alpha=0.03),
-			                                          cv2.COLORMAP_JET)
+			# Detect ArUco markers
+			corners, ids = detect_aruco_markers(color_image)
 
-			results = model(color_image, device=device)
+			if ids is not None:
+				for i, corner in zip(ids, corners):
+					# Calculate the center of the marker
+					corner = corner[0]
+					center_x = int(np.mean(corner[:, 0]))
+					center_y = int(np.mean(corner[:, 1]))
 
-			for r in results:
-				boxes = r.boxes
-				masks = r.masks
+					# Get depth at the center of the marker
+					depth_meters = get_center_depth(center_x, center_y, filled_depth_image)
 
-				if masks is not None:
-					for seg, box in zip(masks.xy, boxes):
-						x1, y1, x2, y2 = map(int, box.xyxy[0])
+					if depth_meters is None:
+						logger.warning(f"No valid depth data for ArUco ID {int(i)} at center [{center_x}, {center_y}]")
+						continue
 
-						center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
-						depth = filled_depth_image[center_y, center_x]
-						depth_meters = depth / 1000.0
+					# Publish ArUco detection data to NetworkTables
+					sd.putNumber("ArucoID", int(i))
+					sd.putNumber("ArucoDepth", depth_meters)
+					sd.putNumberArray("ArucoCenter", [center_x, center_y])
+					sd.putNumberArray("ArucoCorners", corner.flatten().tolist())
+					sd.putNumber("ArucoAngle", (center_x - 640) * 0.1)
 
-						# Publish detection data to NetworkTables
-						sd.putString("DetectedObject", r.names[int(box.cls)])
-						sd.putNumber("ObjectDepth", depth_meters)
-						sd.putNumberArray("ObjectCoordinates", [x1, y1, x2, y2])
-						sd.putNumber("ObjectAngle", (center_x - 640) * 0.1)
+					# Annotate the color image in debug mode
+					if DEBUG_MODE:
+						# Draw the marker boundary and center
+						cv2.polylines(color_image, [corner.astype(int)], True, (0, 255, 0), 2)
+						cv2.circle(color_image, (center_x, center_y), 5, (255, 0, 0), -1)
 
-						if DEBUG_MODE:
-							logger.debug(
-								f"Detected {r.names[int(box.cls)]} at depth {depth_meters:.2f}m, coordinates: [{x1}, {y1}, {x2}, {y2}]")
+						# Overlay depth and ID information on the image
+						cv2.putText(color_image, f"ID: {int(i)}", (center_x - 50, center_y - 10),
+						            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+						cv2.putText(color_image, f"Depth: {depth_meters:.2f}m", (center_x - 50, center_y + 10),
+						            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+						logger.debug(f"Detected ArUco ID {int(i)} at depth {depth_meters:.2f}m, center: [{center_x}, {center_y}]")
 
 			frame_counter += 1
 			end_time = time.time()
@@ -140,6 +162,19 @@ def main():
 
 			sd.putNumber("FPS", fps)
 
+			# Show live video if in debug mode
+			if DEBUG_MODE:
+				# Display the color image with annotations
+				cv2.imshow('ArUco Detection', color_image)
+
+				# Display the depth data
+				depth_colormap = convert_depth_image(filled_depth_image)
+				cv2.imshow('Depth Data', depth_colormap)
+
+				# Exit if 'q' key is pressed
+				if cv2.waitKey(1) & 0xFF == ord('q'):
+					break
+
 	except KeyboardInterrupt:
 		logger.info("Program interrupted by user")
 	except Exception as e:
@@ -147,8 +182,8 @@ def main():
 		logger.error(traceback.format_exc())
 	finally:
 		pipeline.stop()
+		cv2.destroyAllWindows()
 		logger.info("Program terminated")
-
 
 if __name__ == "__main__":
 	while True:
